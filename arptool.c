@@ -2,10 +2,10 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <linux/if_packet.h>
-#include <net/ethernet.h> /* for ETHERTYPE_IP */
+#include <net/ethernet.h>
 #include <net/if.h>
 #include <net/if_arp.h>
-#include <netinet/ether.h> /* for ether_ntoa() */
+#include <netinet/ether.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,11 +14,13 @@
 #include <unistd.h>
 
 #define clear_struct(s) memset((s), 0, sizeof((*s)));
-#define __align_size(s) (((s) + 0xf) & ~(0xf))
+
 /*
- * TODO:
+ * On operating systems running on the Linux kernel,
+ * the binary needs to either have the set UID bit
+ * set (bad idea), or have its net capabilities set:
  *
- * Make this portable to windows.
+ * sudo setcap cap_net_raw,cap_net_broadcast=ep </path/to/binary>
  */
 
 int
@@ -37,6 +39,12 @@ __check_args(int argc, char *argv[])
 	char *dot;
 	unsigned short val = 0;
 
+/*
+ * Make sure the IP address is legal. Four dots
+ * in total (one appended at the end above), and
+ * ensure that each isolated value is not greater
+ * than 255.
+ */
 	while (1)
 	{
 		dot = memchr(s, '.', (e - s));
@@ -76,15 +84,22 @@ __attribute__((__noreturn__)) usage(int status)
 	exit(status);
 }
 
-#define HARDWARE_ADDR 0
-#define IP_ADDR 1
-#define IF_INDEX 2
-
 #define HARDWARE_ADDR_SIZE 6 /* MAC addresses are 48 bits (6 bytes) */
 #define PROTOCOL_SIZE 4 /* IPv4 addresses are 32 bits (4 bytes) */
 
+/*
+ * Set this to 1 when we get the name of the
+ * network interface so we do not keep doing
+ * it everytime __do_if_request() is called.
+ */
 static int got_if_name = 0;
 
+/**
+ * Do an ioctl() request
+ *
+ * @_ifr: the interface request structure to put result
+ * @type: the type of request (e.g., SIOCGIFHWADDR)
+ */
 static int
 __do_if_request(struct ifreq *_ifr, int type)
 {
@@ -117,49 +132,10 @@ __do_if_request(struct ifreq *_ifr, int type)
 		if_freenameindex(ifnames);
 	}
 
-
-	switch(type)
+	if (ioctl(tmp_sock, type, _ifr) < 0)
 	{
-		case HARDWARE_ADDR:
-
-			if (ioctl(tmp_sock, SIOCGIFHWADDR, _ifr) < 0)
-			{
-				fprintf(stderr, "%s: failed to get hardware address (%s)\n", __func__, strerror(errno));
-				goto fail;
-			}
-
-#ifdef DEBUG
-			fprintf(stdout, "Got our hardware address: \"%s\"\n", ether_ntoa((const struct ether_addr *)&_ifr->ifr_hwaddr.sa_data));
-#endif
-			break;
-
-		case IP_ADDR:
-
-			if (ioctl(tmp_sock, SIOCGIFADDR, _ifr) < 0)
-			{
-				fprintf(stderr, "%s: failed to get IP address (%s)\n", __func__, strerror(errno));
-				goto fail;
-			}
-
-#ifdef DEBUG
-			fprintf(stdout, "Got our IP address: \"%s\"\n", inet_ntoa(((struct sockaddr_in *)&_ifr->ifr_addr)->sin_addr));
-#endif
-			break;
-
-		case IF_INDEX:
-
-			if (ioctl(tmp_sock, SIOCGIFINDEX, _ifr) < 0)
-			{
-				fprintf(stderr, "%s: failed to get interface index for \"%s\" (%s)\n", __func__, ifnames[i].if_name, strerror(errno));
-				goto fail;
-			}
-
-			break;
-
-		default:
-
-			fprintf(stderr, "%s: Unknown address type requested (%d)\n", __func__, type);
-			return -1;
+		fprintf(stderr, "%s: failed to get device information (type=%d)\n", __func__, type);
+		goto fail;
 	}
 
 	return 0;
@@ -230,7 +206,7 @@ send_arp_request(const char *ip_addr)
 /*
  * Get the hardware address of our network interface.
  */
-	if (__do_if_request(&skbuf.ifr, HARDWARE_ADDR) < 0)
+	if (__do_if_request(&skbuf.ifr, SIOCGIFHWADDR) < 0)
 		goto fail;
 
 	memcpy(&skbuf.arp_data.local_hw, &skbuf.ifr.ifr_hwaddr.sa_data, ETH_ALEN);
@@ -238,7 +214,7 @@ send_arp_request(const char *ip_addr)
 /*
  * Get the IPv4 address that our interface uses.
  */
-	if (__do_if_request(&skbuf.ifr, IP_ADDR) < 0)
+	if (__do_if_request(&skbuf.ifr, SIOCGIFADDR) < 0)
 		goto fail;
 
 	memcpy(&skbuf.arp_data.local_ip, (void *)&((struct sockaddr_in *)&skbuf.ifr.ifr_addr)->sin_addr, PROTOCOL_SIZE);
@@ -248,7 +224,7 @@ send_arp_request(const char *ip_addr)
  * (we need it to fill in the link-layer socket
  * structure (struct sockaddr_ll).
  */
-	if (__do_if_request(&skbuf.ifr, IF_INDEX) < 0)
+	if (__do_if_request(&skbuf.ifr, SIOCGIFINDEX) < 0)
 		goto fail;
 
 	skbuf.ifidx = skbuf.ifr.ifr_ifindex;
@@ -270,7 +246,8 @@ send_arp_request(const char *ip_addr)
 	skbuf.arp_hdr.ar_pln = PROTOCOL_SIZE; /* takes up one byte */
 	skbuf.arp_hdr.ar_op = htons(ARPOP_REQUEST); /* two bytes */
 
-	memcpy(&skbuf.arp_data.remote_hw, ether_broadcast, ETH_ALEN);
+	memset(&skbuf.arp_data.remote_hw, 0, ETH_ALEN);
+	//memcpy(&skbuf.arp_data.remote_hw, ether_broadcast, ETH_ALEN);
 /*
  * inet_addr() converts the IP in string format
  * to in_addr_t in network-byte order.
@@ -309,11 +286,6 @@ send_arp_request(const char *ip_addr)
 			"\"Who has %s? Tell %s\"\n",
 			ip_addr, inet_ntoa(skbuf.arp_data.local_ip));
 
-	//struct sockaddr_ll rsll;
-	//socklen_t rlen;
-
-	//clear_struct(&rsll);
-	
 	//bytes = recvfrom(raw_fd, &inbuf, packet_size, 0, (struct sockaddr *)&rsll, (socklen_t *)&rlen);
 	bytes = recv(raw_fd, &inbuf, packet_size, 0);
 
@@ -340,9 +312,6 @@ send_arp_request(const char *ip_addr)
 	return -1;
 }
 
-/*
- * Send a "Who has <ip address>, tell <arp source ip address>
- */
 int
 main(int argc, char *argv[])
 {
