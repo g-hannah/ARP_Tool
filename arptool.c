@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -287,23 +288,37 @@ send_arp_request(const char *ip_addr)
 			ip_addr, inet_ntoa(skbuf.arp_data.local_ip));
 
 	//bytes = recvfrom(raw_fd, &inbuf, packet_size, 0, (struct sockaddr *)&rsll, (socklen_t *)&rlen);
-	bytes = recv(raw_fd, &inbuf, packet_size, 0);
+	fd_set rset;
+	struct timeval tv = {0};
 
-	if (bytes <= 0)
+	FD_ZERO(&rset);
+	FD_SET(raw_fd, &rset);
+	tv.tv_sec = 2;
+
+	select(raw_fd+1, &rset, NULL, NULL, &tv);
+
+	if (FD_ISSET(raw_fd, &rset))
 	{
-		fprintf(stderr, "%s: recv error (%s)\n", __func__, strerror(errno));
-		goto fail;
-	}
-
+		bytes = recv(raw_fd, &inbuf, packet_size, 0);
+		if (bytes <= 0)
+		{
+			fprintf(stderr, "%s: recv error (%s)\n", __func__, strerror(errno));
+			goto fail;
+		}
 /*
  * The hardware address will be stored within LOCAL_HW in the
  * received data buffer since it is local from the perspective
  * of the sending remote host.
  */
-	fprintf(stdout,
+		fprintf(stdout,
 			"\n"
 			"  %s is at %s\n",
 			ip_addr, ether_ntoa((const struct ether_addr *)&inbuf.arp_data.local_hw));
+	}
+	else
+	{
+		fprintf(stdout, "\n No device on the local network is using this IP\n");
+	}
 
 	return 0;
 
